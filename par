@@ -1,0 +1,229 @@
+# Author: Dieqiao Feng
+# Date: Jan 9, 2024
+
+import collections
+from typing import Literal
+import copy
+
+with open('set.mm', 'r') as f:
+    raw_text = f.read()
+
+toks = raw_text.split()
+
+constants: set[str] = set()
+var_type: dict[str, str] = dict()
+
+num_open_brackets = 0
+num_exception = 0
+grammar = []
+for i, tok in enumerate(toks):
+    if tok == '$(':
+        num_open_brackets += 1
+    elif tok == '$)':
+        num_open_brackets -= 1
+    elif num_open_brackets == 0:
+        if tok == '$c':
+            j = i + 1
+            while toks[j] != '$.':
+                assert toks[j] not in constants
+                constants.add(toks[j])
+                j += 1
+        elif tok == '$f':
+            assert toks[i + 1] in constants
+            assert toks[i + 3] == '$.'
+            if toks[i + 2] in var_type:
+                assert var_type.get(toks[i + 2]) == toks[i + 1]
+            else:
+                var_type[toks[i + 2]] = toks[i + 1]
+        elif tok in ['$e', '$p']:
+            try:
+                assert toks[i + 1] == '|-'
+            except:
+                num_exception += 1
+                print(f"[Exception.{num_exception}]", ' '.join(toks[i - 1:toks.index('$.', i) + 1]))
+        elif tok == '$a':
+            assert toks[i + 1] in ['wff', 'class', '|-']
+            if toks[i + 1] in ['wff', 'class']:
+                j = i + 1
+                while toks[j] != '$.':
+                    j += 1
+
+                tmp_toks = copy.copy(toks[i + 1:j])
+                for k in range(1, len(tmp_toks)):
+                    if tmp_toks[k] not in constants:
+                        assert tmp_toks[k] in var_type
+                        tmp_toks[k] = var_type[tmp_toks[k]]
+                    else:
+                        assert tmp_toks[k] not in ['class', 'setvar', 'wff']
+                grammar.append((tmp_toks[0], tuple(tmp_toks[1:])))
+print('=================================================')
+
+print(">>> The first two syntactic theorems are redundant since `class` -> `setvar` in out parsing grammar <<<")
+print(">>> The third syntactic theorems can be removed since not used elsewhere <<<")
+print('=================================================')
+
+
+
+class SLRParser:
+    r"""
+    This is a `set.mm` specialized parser. Don't expect it to parse any other general LR languages
+    S' -> wff $
+    wff -> '-.' wff
+
+    ...
+
+    wff -> $var:wff$
+    setvar -> $var:setvar$
+    class -> $var:class$
+    """
+
+    def __init__(
+        self,
+        constants: set[str],
+        grammar: list[tuple[str, tuple[str, ...]]],
+    ):
+        self.goal_symbol = 'goal'
+        self.eof_symbol = 'eof'
+        assert self.goal_symbol not in constants and self.eof_symbol not in constants
+
+        self.nonterminal_symbols = {'wff', 'class', self.goal_symbol}
+        self.terminal_symbols = constants - {'class', 'wff'}
+
+        # Determine constant symbols that can be easily type,
+        # e.g., 'class comLaw', 'wff T.'
+        symbol_count = []
+        for _, statement in grammar:
+            symbol_count += list(set(statement))
+        symbol_count = collections.Counter(symbol_count)
+        simple_typed: dict[str, str] = {}
+        tmp_grammar = grammar
+        grammar = []
+        for typecode, statement in tmp_grammar:
+            if len(statement) == 1 and symbol_count[statement[0]] == 1:
+                simple_typed[statement[0]] = typecode
+                self.terminal_symbols.remove(statement[0])
+            else:
+                grammar.append((typecode, statement))
+
+        # Build up parsing rules
+        self.parse_rules: dict[str, list[tuple[str, ...]]] = {
+            'class': [],
+            'wff': [],
+            self.goal_symbol: [('wff', self.eof_symbol)],
+        }
+        for typecode, statement in grammar:
+            self.parse_rules[typecode].append(statement)
+
+        # only wff can add class
+        assert any(statement[0] == 'class' for statement in self.parse_rules['wff'])
+        assert all(statement[0] != 'wff' for statement in self.parse_rules['wff'])
+
+        assert all(statement[0] != 'wff' for statement in self.parse_rules['class'])
+        assert all(statement[0] != 'class' for statement in self.parse_rules['class'])
+
+        # compute the first set
+        first_set = {
+            'class': set(),
+            'wff': set(),
+            self.goal_symbol: set(),
+        }
+        for statement in self.parse_rules['class']:
+            if statement[0] not in ['class', 'wff']:
+                first_set['class'].add(statement[0])
+                first_set['wff'].add(statement[0])
+        for statement in self.parse_rules['wff']:
+            if statement[0] not in ['class', 'wff']:
+                first_set['wff'].add(statement[0])
+
+        follow_set = {
+            'class': set(),
+            'wff': set(),
+            self.goal_symbol: set(),
+        }
+        while True:
+            class_size = len(follow_set['class'])
+            wff_size = len(follow_set['wff'])
+            for typecode in self.nonterminal_symbols:
+                for statement in self.parse_rules[typecode]:
+                    for i in range(len(statement) - 1):
+                        if statement[i] in self.nonterminal_symbols:
+                            if statement[i + 1] in self.nonterminal_symbols:
+                                follow_set[statement[i]] |= first_set[statement[i + 1]]
+                            else:
+                                follow_set[statement[i]].add(statement[i + 1])
+                    if statement[-1] in self.nonterminal_symbols:
+                        follow_set[statement[-1]] |= follow_set[typecode]
+            if class_size == len(follow_set['class']) and wff_size == len(follow_set['wff']):
+                break
+
+
+        def get_closure(state: set[tuple['str', tuple['str', ...], int]]) -> tuple[tuple['str', tuple['str', ...], int]]:
+            to_add_wff = to_add_class = False
+            for _, statement, pos in state:
+                if pos < len(statement):
+                    to_add_wff |= statement[pos] == 'wff'
+                    to_add_class |= statement[pos] == 'class'
+            to_add_class |= to_add_wff
+
+            if to_add_class:
+                for statement in self.parse_rules['class']:
+                    state.add(('class', statement, 0))
+            if to_add_wff:
+                for statement in self.parse_rules['wff']:
+                    state.add(('wff', statement, 0))
+
+            return tuple(sorted(state))
+
+        # state is sorted ((wff, statement, pos), ... ())
+        init_state = get_closure({('goal', ('wff', self.eof_symbol), 0)})
+        state_map = {init_state: 0}
+        state_list = [init_state]
+        
+        lo = 0
+        while lo < len(state_list):
+            state = state_list[lo]
+            lo += 1
+
+            action_set = set()
+            for _, statement, pos in state:
+                if pos < len(statement):
+                    action = statement[pos]
+                    if action in action_set:
+                        continue
+                    action_set.add(action)
+                    new_state = set()
+                    for typecode, statement, pos in state:
+                        if pos < len(statement) and statement[pos] == action:
+                            new_state.add((typecode, statement, pos + 1))
+                    new_state = get_closure(new_state)
+
+                    if new_state not in state_map:
+                        state_map[new_state] = len(state_map)
+                        state_list.append(new_state)
+        
+        for state in state_list:
+            if any(pos == len(statement) for _, statement, pos in state) and len(state) > 1:
+                assert sum(pos == len(statement) for _, statement, pos in state) == 1
+                for typecode, statement, pos in state:
+                    if pos == len(statement):
+                        break
+                solved = True 
+                print(typecode)
+                for _, statement, pos in state:
+                    if pos < len(statement):
+                        assert statement[pos] in self.terminal_symbols 
+                        if statement[pos] in follow_set[typecode]:
+                            solved = False
+
+                if not solved:
+                    for s in state:
+                        print(s)
+                    print()
+        from IPython import embed; embed()
+
+
+
+parser = SLRParser(
+    constants=constants,
+    grammar=grammar,
+)
